@@ -3,6 +3,7 @@ package repos
 import (
 	"context"
 	"errors"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -23,6 +24,10 @@ type failingDeleteClient struct {
 	*forge.FakeClient
 	failVars    map[string]bool
 	failSecrets map[string]bool
+	// cancelOnVar / cancelOnSecret, when set, are called on the first
+	// variable / secret delete to cancel the uninstall context mid-loop.
+	cancelOnVar    context.CancelFunc
+	cancelOnSecret context.CancelFunc
 
 	mu             sync.Mutex
 	varCalls       []string
@@ -34,6 +39,9 @@ func (c *failingDeleteClient) DeleteRepoVariable(ctx context.Context, owner, rep
 	c.mu.Lock()
 	c.varCalls = append(c.varCalls, name)
 	c.mu.Unlock()
+	if c.cancelOnVar != nil {
+		c.cancelOnVar()
+	}
 	if c.failVars[name] {
 		return errors.New("500 from server: " + deleteServerDetail)
 	}
@@ -44,6 +52,9 @@ func (c *failingDeleteClient) DeleteRepoSecret(ctx context.Context, owner, repo,
 	c.mu.Lock()
 	c.secretCalls = append(c.secretCalls, name)
 	c.mu.Unlock()
+	if c.cancelOnSecret != nil {
+		c.cancelOnSecret()
+	}
 	if c.failSecrets[name] {
 		return errors.New("500 from server: " + deleteServerDetail)
 	}
@@ -81,15 +92,32 @@ func TestUninstall_FailedDeleteAttemptsRemainingNames(t *testing.T) {
 				out = append(out, names[len(names)/2])
 			case "last":
 				out = append(out, names[len(names)-1])
+			default:
+				// Any other entry names the secret or variable to fail.
+				out = append(out, p)
 			}
 		}
 		return out
 	}
 	positionSets := [][]string{{"first"}, {"middle"}, {"last"}, {"first", "last"}}
+	// The positions above only reach the trace signing key among the
+	// redacted secrets, so GitLab also fails the trigger token and webhook
+	// secret by name, alone and joined with a non-redacted failure.
+	gitlabRedactedSecretSets := [][]string{
+		{forge.SecretTriggerToken},
+		{forge.SecretWebhookSecret},
+		{forge.SecretTriggerToken, forge.SecretJiraToken},
+		{forge.SecretWebhookSecret, forge.SecretJiraToken},
+		{forge.SecretTriggerToken, forge.SecretWebhookSecret, forge.SecretJiraToken},
+	}
 
 	for _, forgeName := range []string{ForgeGitHub, ForgeGitLab} {
 		for _, kind := range []string{"variable", "secret"} {
-			for _, positions := range positionSets {
+			sets := positionSets
+			if forgeName == ForgeGitLab && kind == "secret" {
+				sets = slices.Concat(positionSets, gitlabRedactedSecretSets)
+			}
+			for _, positions := range sets {
 				name := forgeName + "/" + kind + "/" + strings.Join(positions, "+")
 				t.Run(name, func(t *testing.T) {
 					var fake *forge.FakeClient
@@ -162,13 +190,16 @@ func TestUninstall_FailedDeleteAttemptsRemainingNames(t *testing.T) {
 									assert.NotContains(t, line, deleteServerDetail, "server text for %s must be withheld", n)
 								}
 							}
+							reported := false
 							for _, progress := range progressLines {
 								for line := range strings.SplitSeq(progress, "\n") {
 									if strings.Contains(line, "deleting secret "+n) {
-										assert.NotContains(t, line, deleteServerDetail)
+										reported = true
+										assert.NotContains(t, line, deleteServerDetail, "progress text for %s must withhold server text", n)
 									}
 								}
 							}
+							assert.True(t, reported, "failure of %s must be reported in progress output", n)
 						}
 					} else {
 						assert.Equal(t, len(secrets), r.SecretsDeleted)
@@ -179,5 +210,53 @@ func TestUninstall_FailedDeleteAttemptsRemainingNames(t *testing.T) {
 				})
 			}
 		}
+	}
+}
+
+// Once the uninstall context is cancelled, each delete loop stops and
+// reports one error for the remaining names instead of one per name.
+func TestUninstall_CancelledContextStopsDeleteLoop(t *testing.T) {
+	for _, kind := range []string{"variable", "secret"} {
+		t.Run(kind, func(t *testing.T) {
+			fake := newInstalledFakeClient("acme/api")
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+
+			client := &failingDeleteClient{FakeClient: fake}
+			names := uninstallLoopVars(ForgeGitHub)
+			if kind == "secret" {
+				client.cancelOnSecret = cancel
+				names = UninstallSecretsForForge(ForgeGitHub)
+			} else {
+				client.cancelOnVar = cancel
+			}
+			require.Greater(t, len(names), 1, "the loop must have names left after the first delete")
+
+			results, err := Uninstall(ctx, UninstallConfig{
+				Manifest:       testManifest("acme/api"),
+				Repos:          []string{"acme/api"},
+				Direct:         true,
+				MaxConcurrency: 4,
+			}, newTestClientFactory(client), uninstallCommitFn(fake), nil)
+			require.NoError(t, err)
+			require.Len(t, results, 1)
+			r := results[0]
+
+			assert.False(t, r.Success)
+			require.Error(t, r.Error)
+			assert.ErrorIs(t, r.Error, context.Canceled)
+
+			calls := client.varCalls
+			plural := "variables"
+			if kind == "secret" {
+				calls = client.secretCalls
+				plural = "secrets"
+			}
+			assert.Equal(t, names[:1], calls, "no %s delete may run after the context is cancelled", kind)
+
+			msg := r.Error.Error()
+			assert.Equal(t, 1, strings.Count(msg, "deleting remaining "+plural+": "+context.Canceled.Error()), msg)
+			assert.NotContains(t, msg, "deleting "+kind+" ", "the cancellation must not be reported per name")
+		})
 	}
 }

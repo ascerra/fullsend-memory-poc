@@ -596,11 +596,18 @@ func uninstallRepoResources(ctx context.Context, cfg ResolvedConfig, direct bool
 	// A failed delete does not stop the loop: every remaining name is still
 	// attempted so one failure cannot leave later credentials in place, and
 	// each failure is reported. Each goroutine keeps its own error slice.
+	// Once the context is done no further delete can succeed, so the loop
+	// records one error for the remaining names and stops rather than
+	// adding a cancellation error per name that would bury real failures.
 	innerWg.Add(2)
 	go func() {
 		defer innerWg.Done()
 		var errs []error
 		for _, name := range forgeVars {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				errs = append(errs, fmt.Errorf("deleting remaining variables: %w", ctxErr))
+				break
+			}
 			if delErr := client.DeleteRepoVariable(ctx, owner, repo, name); delErr != nil {
 				errs = append(errs, fmt.Errorf("deleting variable %s: %w", name, delErr))
 				continue
@@ -613,6 +620,10 @@ func uninstallRepoResources(ctx context.Context, cfg ResolvedConfig, direct bool
 		defer innerWg.Done()
 		var errs []error
 		for _, name := range forgeSecrets {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				errs = append(errs, fmt.Errorf("deleting remaining secrets: %w", ctxErr))
+				break
+			}
 			if delErr := client.DeleteRepoSecret(ctx, owner, repo, name); delErr != nil {
 				if name == forge.SecretTriggerToken || name == forge.SecretWebhookSecret || name == forge.SecretTraceSigningKey {
 					// The webhook credentials and the trace signing key are
