@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "memory": {
+      "type": "http",
+      "url": "https://memory-gateway-508990529289.us-east4.run.app/mcp",
+      "headers": {
+        "Authorization": "Bearer ${MEMORY_TOKEN}",
+        "X-Memory-Run": "${MEMORY_RUN_ID}"
+      }
+    }
+  }
+}
