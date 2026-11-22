@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"testing"
 
 	"github.com/fullsend-ai/fullsend/internal/config"
@@ -156,6 +157,80 @@ func TestEnsureManagedConfigDefaults_GlobCoveredGetsScopedEntry(t *testing.T) {
 	assert.Equal(t, "acme/api", m.GitHub.Repos[1].Name)
 	assert.Equal(t, "v1.2.3", m.GitHub.Repos[1].FullsendRef, "the carved entry keeps the glob's settings")
 	assert.True(t, m.GitHub.Repos[1].Config.IsSet())
+}
+
+// globSelectionCases are overlapping globs whose first entry covers the
+// repository only when case is ignored. Selection matches a glob
+// case-sensitively, so the new entry must copy the glob that selected the
+// repository; a fork, which the org listing omits, is selected by name
+// through the first glob that covers it ignoring case.
+var globSelectionCases = []struct {
+	name string
+	repo string
+	fork bool
+	// copied is the glob entry the new entry is copied from; its
+	// fullsend_ref is v1.2.3 and the other glob's is v9.9.9.
+	copied string
+	globs  []RepoEntry
+}{
+	{name: "name differs in case from the first glob", repo: "acme/Infra-Tools", copied: "acme/*", globs: []RepoEntry{
+		{Name: "acme/infra-*", FullsendRef: "v9.9.9"}, {Name: "acme/*", FullsendRef: "v1.2.3"},
+	}},
+	{name: "name matches the first glob", repo: "acme/infra-tools", copied: "acme/infra-*", globs: []RepoEntry{
+		{Name: "acme/infra-*", FullsendRef: "v1.2.3"}, {Name: "acme/*", FullsendRef: "v9.9.9"},
+	}},
+	{name: "fork selected by name", repo: "acme/Infra-Tools", fork: true, copied: "acme/infra-*", globs: []RepoEntry{
+		{Name: "acme/infra-*", FullsendRef: "v1.2.3"}, {Name: "acme/*", FullsendRef: "v9.9.9"},
+	}},
+}
+
+func TestEnsureManagedConfigDefaults_GlobCoveredCopiesSelectingGlob(t *testing.T) {
+	for _, tc := range globSelectionCases {
+		t.Run(tc.name, func(t *testing.T) {
+			m := &Manifest{Version: 1, Defaults: testInferenceDefaults(), GitHub: &PlatformConfig{Repos: slices.Clone(tc.globs)}}
+			path := writebackManifestFile(t, m)
+			fc := newFakeClientForBatch(tc.repo)
+			fc.Repos[0].Fork = tc.fork
+
+			var msgs []string
+			names, err := EnsureManagedConfigDefaults(context.Background(), ManagedConfigWritebackConfig{
+				Manifest: m, ManifestPath: path, RepoFilter: []string{tc.repo},
+			}, newTestClientFactory(fc), func(repo, _, msg string) { msgs = append(msgs, repo+": "+msg) })
+			require.NoError(t, err)
+			assert.Equal(t, []string{tc.repo}, names)
+			require.Len(t, msgs, 1)
+			assert.Contains(t, msgs[0], "in the new manifest entry "+tc.repo+", copied from the glob entry "+tc.copied)
+
+			require.Len(t, m.GitHub.Repos, len(tc.globs)+1, "one entry is carved out")
+			for i, g := range tc.globs {
+				assert.False(t, m.GitHub.Repos[i].Config.IsSet(), "the glob entry %s is unchanged", g.Name)
+			}
+			carved := findExplicitEntry(m, tc.repo)
+			require.NotNil(t, carved)
+			assert.Equal(t, "v1.2.3", carved.FullsendRef, "the carved entry keeps the settings of %s", tc.copied)
+			assert.True(t, carved.Config.IsSet())
+		})
+	}
+}
+
+func TestEnsureManagedConfigDefaults_ReadOnlyGlobCoveredSuggestsSelectingGlob(t *testing.T) {
+	for _, tc := range globSelectionCases {
+		t.Run(tc.name, func(t *testing.T) {
+			m := &Manifest{Version: 1, Defaults: testInferenceDefaults(), GitHub: &PlatformConfig{Repos: slices.Clone(tc.globs)}}
+			fc := newFakeClientForBatch(tc.repo)
+			fc.Repos[0].Fork = tc.fork
+
+			_, err := EnsureManagedConfigDefaults(context.Background(), ManagedConfigWritebackConfig{
+				Manifest: m, ManifestPath: "https://example.com/repos.yaml", RepoFilter: []string{tc.repo},
+			}, newTestClientFactory(fc), nil)
+			require.Error(t, err)
+			msg := err.Error()
+			assert.Contains(t, msg, "- name: "+tc.repo)
+			assert.Contains(t, msg, "fullsend_ref: v1.2.3", "the suggested entry carries the settings of %s", tc.copied)
+			assert.NotContains(t, msg, "v9.9.9")
+			require.Len(t, m.GitHub.Repos, len(tc.globs), "a read-only manifest is not edited in memory either")
+		})
+	}
 }
 
 func TestEnsureManagedConfigDefaults_GlobFilterOnlyTouchesFirstInstalls(t *testing.T) {
