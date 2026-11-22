@@ -10,6 +10,16 @@ runtime: claude
 agents:
     - name: prioritize
       enabled: false
+    - name: triage
+      source: harness/triage.yaml
+    - name: code
+      source: harness/code.yaml
+    - name: review
+      source: harness/review.yaml
+    - name: fix
+      source: harness/fix.yaml
+    - name: retro
+      source: harness/retro.yaml
 inference:
     project: it-gcp-konflux-dev-fullsend
     wif_provider: projects/855403973659/locations/global/workloadIdentityPools/fullsend-inference/providers/gh-ascerra-fullsend-memory-poc
