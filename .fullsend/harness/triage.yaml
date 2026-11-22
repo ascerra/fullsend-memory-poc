@@ -1,0 +1,25 @@
+# The stock triage agent (fullsend-ai/agents v0.57.1) with this repository's
+# memory tools added. Everything not listed here comes from the pinned
+# upstream definition.
+base: https://raw.githubusercontent.com/fullsend-ai/agents/ea29de9bb8b1729b04c0597b48a5c7aae62deb71/harness/triage.yaml#sha256=ce30d5eea5c13c7cf33a7feffa9342d33cb918d485d0587c1030e04766884a0d
+
+# The stock agent file lets triage use only gh, curl, jq and skills. This
+# copy of it also allows the memory tools; nothing else in it differs.
+agent: agents/triage.md
+
+# One extra network destination, the memory service, and the credential the
+# sandbox proxy attaches to requests going there.
+providers:
+  - providers/memory.yaml
+openshell:
+  profiles:
+    - profiles/memory-gateway.yaml
+
+# Registers the memory service's tools with the agent.
+plugins:
+  - plugins/memory
+
+env:
+  sandbox:
+    # Lets the memory service file what this run proposes under its run.
+    MEMORY_RUN_ID: "${GITHUB_RUN_ID}"

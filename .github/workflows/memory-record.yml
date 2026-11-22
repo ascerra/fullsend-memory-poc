@@ -1,0 +1,192 @@
+# Records what agent runs proposed for this repository's memory.
+#
+# Agents can read memory and leave proposals in a holding area; they cannot
+# write memory. This workflow is the one thing that can turn proposals into
+# memory. The memory service accepts writes only from this file on the main
+# branch, which it checks with the identity token GitHub issues to the job.
+# No secret is stored for it.
+#
+# It runs after every finished run of the fullsend workflow, from the copy of
+# this file on the default branch. It checks out nothing and runs no code
+# from a pull request.
+name: memory-record
+
+on:
+  workflow_run:
+    workflows: [fullsend]
+    types: [completed]
+
+permissions: {}
+
+# Attempts of the same fullsend run are recorded one after another. Different
+# runs do not wait for each other, so none is dropped from a queue.
+concurrency:
+  group: memory-record-${{ github.event.workflow_run.id }}
+  cancel-in-progress: false
+
+jobs:
+  record:
+    # A fullsend run in which every job was skipped ran no agent.
+    if: github.event.workflow_run.conclusion != 'skipped'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      id-token: write      # the identity token presented to the memory service
+      actions: read        # which agent ran in the finished run, and how it ended
+      issues: read         # whether the work item is an issue or a pull request
+      pull-requests: read
+    env:
+      MEMORY_URL: https://memory-gateway-508990529289.us-east4.run.app
+      MEMORY_AUDIENCE: fullsend-memory-gateway
+      REPO: ${{ github.repository }}
+      RUN_ID: ${{ github.event.workflow_run.id }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Record the finished run
+        run: |
+          python3 -I - <<'PY'
+          import io
+          import json
+          import os
+          import re
+          import sys
+          import time
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+          import zipfile
+
+          API = os.environ.get("GITHUB_API_URL", "https://api.github.com").rstrip("/")
+          repo, run_id, token = os.environ["REPO"], os.environ["RUN_ID"], os.environ["GH_TOKEN"]
+          memory_url, audience = os.environ["MEMORY_URL"].rstrip("/"), os.environ["MEMORY_AUDIENCE"]
+          # The agent jobs of fullsend's dispatch workflow, by job name.
+          AGENT_JOBS = {"Triage": "triage", "Code": "code", "Review": "review", "Fix": "fix", "Retro": "retro"}
+          MAX_ARTIFACT = 64 << 20  # bytes downloaded
+          MAX_RECORD = 32 << 20    # bytes of one unpacked run record
+
+          if not re.fullmatch(r"[0-9]{1,20}", run_id):
+              sys.exit("unexpected run id")
+
+
+          class NoRedirect(urllib.request.HTTPRedirectHandler):
+              def redirect_request(self, *args, **kwargs):
+                  return None
+
+
+          def github(path):
+              req = urllib.request.Request(API + path, headers={
+                  "Authorization": "Bearer " + token,
+                  "Accept": "application/vnd.github+json",
+                  "X-GitHub-Api-Version": "2022-11-28",
+              })
+              with urllib.request.urlopen(req, timeout=60) as resp:
+                  return json.load(resp)
+
+
+          def artifact_zip(artifact_id):
+              # GitHub answers with a redirect to a signed storage address.
+              # Follow it by hand so the token is not sent to the storage host.
+              req = urllib.request.Request(f"{API}/repos/{repo}/actions/artifacts/{artifact_id}/zip", headers={
+                  "Authorization": "Bearer " + token,
+                  "Accept": "application/vnd.github+json",
+              })
+              try:
+                  urllib.request.build_opener(NoRedirect).open(req, timeout=60)
+              except urllib.error.HTTPError as err:
+                  if err.code in (301, 302, 303, 307) and err.headers.get("Location"):
+                      with urllib.request.urlopen(err.headers["Location"], timeout=120) as resp:
+                          data = resp.read(MAX_ARTIFACT + 1)
+                      return data if len(data) <= MAX_ARTIFACT else b""
+                  raise
+              return b""
+
+
+          def work_item(agent):
+              """The issue or pull request the agent worked on, read from the
+              run record fullsend uploads. Only a number is taken from it, and
+              only when the record names this repository."""
+              wanted = re.compile(re.escape(repo) + r"#([0-9]{1,9})")
+              artifacts = github(f"/repos/{repo}/actions/runs/{run_id}/artifacts?per_page=100").get("artifacts", [])
+              for art in artifacts:
+                  if art.get("name") != "fullsend-" + agent or art.get("expired"):
+                      continue
+                  try:
+                      archive = zipfile.ZipFile(io.BytesIO(artifact_zip(art["id"])))
+                  except zipfile.BadZipFile:
+                      continue
+                  with archive:
+                      for info in archive.infolist():
+                          if not info.filename.endswith("run-telemetry.jsonl") or info.file_size > MAX_RECORD:
+                              continue
+                          for line in archive.read(info).decode("utf-8", "replace").splitlines():
+                              try:
+                                  doc = json.loads(line)
+                              except ValueError:
+                                  continue
+                              if not isinstance(doc, dict):
+                                  continue
+                              for rs in doc.get("resourceSpans") or []:
+                                  for ss in rs.get("scopeSpans") or []:
+                                      for span in ss.get("spans") or []:
+                                          for attr in span.get("attributes") or []:
+                                              if attr.get("key") == "fullsend.work_item_id":
+                                                  m = wanted.fullmatch(str((attr.get("value") or {}).get("stringValue", "")))
+                                                  if m:
+                                                      return int(m.group(1))
+              return None
+
+
+          jobs = github(f"/repos/{repo}/actions/runs/{run_id}/jobs?per_page=100").get("jobs", [])
+          runs = []
+          for job in jobs:
+              stage = job.get("name", "").rsplit("/", 1)[-1].strip()
+              agent = AGENT_JOBS.get(stage)
+              conclusion = job.get("conclusion")
+              if not agent or conclusion in (None, "skipped"):
+                  continue
+              number = work_item(agent)
+              if number is None:
+                  # No run record: the agent never started, or its record could
+                  # not be read. Nothing is kept; the entry only clears what
+                  # the run left in the holding area.
+                  item, conclusion = "issue-0", "failure" if conclusion == "success" else conclusion
+              else:
+                  kind = "pr" if "pull_request" in github(f"/repos/{repo}/issues/{number}") else "issue"
+                  item = f"{kind}-{number}"
+              runs.append({"github_run_id": run_id, "agent": agent, "work_item": item, "conclusion": conclusion})
+
+          if not runs:
+              print("No agent ran in this run; nothing to record.")
+              sys.exit(0)
+
+          req = urllib.request.Request(
+              os.environ["ACTIONS_ID_TOKEN_REQUEST_URL"] + "&audience=" + urllib.parse.quote(audience),
+              headers={"Authorization": "bearer " + os.environ["ACTIONS_ID_TOKEN_REQUEST_TOKEN"]})
+          with urllib.request.urlopen(req, timeout=30) as resp:
+              identity = json.load(resp)["value"]
+
+          summary = None
+          for attempt in range(3):
+              req = urllib.request.Request(memory_url + "/v1/record", method="POST",
+                                           data=json.dumps({"runs": runs}).encode(),
+                                           headers={"Authorization": "Bearer " + identity, "Content-Type": "application/json"})
+              try:
+                  with urllib.request.urlopen(req, timeout=120) as resp:
+                      summary = json.load(resp)
+                  break
+              except urllib.error.HTTPError as err:
+                  # 503 means the service did not start on the request, so it
+                  # is safe to ask again. Anything else is final.
+                  if err.code == 503 and attempt < 2:
+                      time.sleep(float(os.environ.get("MEMORY_RETRY_SECONDS", "15")))
+                      continue
+                  sys.exit(f"the memory service answered {err.code}: {err.read().decode('utf-8', 'replace')[:300]}")
+
+          lines = [f"{run['agent']} on {run['work_item']}: {run['conclusion']}" for run in runs]
+          lines.append("recorded: " + json.dumps({k: v for k, v in summary.items() if k != "skipped"}))
+          lines += ["note: " + str(note) for note in summary.get("skipped") or []]
+          print("\n".join(lines))
+          if os.environ.get("GITHUB_STEP_SUMMARY"):
+              with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as out:
+                  out.write("### Memory recorded\n\n" + "\n".join("- " + line for line in lines) + "\n")
+          PY

@@ -1,0 +1,10 @@
+---
+# The memory service identifies a caller by the run's own GitHub App token:
+# it asks GitHub which repository the token is for and which agent's App it
+# belongs to. No separate secret exists. The sandbox only ever holds a
+# placeholder; the proxy swaps in the token on requests to the memory
+# service's host and nowhere else.
+name: memory
+type: memory-gateway
+credentials:
+  MEMORY_TOKEN: "${GH_TOKEN}"

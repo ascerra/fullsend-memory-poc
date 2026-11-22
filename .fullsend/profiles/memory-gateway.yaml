@@ -1,0 +1,36 @@
+---
+id: memory-gateway
+display_name: Memory gateway
+description: Recall and propose memories of earlier agent runs on this repository
+category: data
+credentials:
+  - name: github_token
+    description: The run's GitHub App token, checked by the memory service with GitHub
+    env_vars: [MEMORY_TOKEN]
+    required: true
+    auth_style: bearer
+    header_name: authorization
+# One host, one path. `path` also limits where the credential is attached.
+# POST carries every tool call. DELETE ends a session. GET is how a client
+# asks for a server-sent stream; the service has none and answers 405, which
+# tells the client so cleanly.
+endpoints:
+  - host: memory-gateway-508990529289.us-east4.run.app
+    port: 443
+    path: /mcp
+    protocol: rest
+    enforcement: enforce
+    rules:
+      - allow:
+          method: POST
+          path: /mcp
+      - allow:
+          method: DELETE
+          path: /mcp
+      - allow:
+          method: GET
+          path: /mcp
+# Claude Code opens the connection itself (its launcher runs on node).
+binaries:
+  - "**/claude"
+  - "**/node"
