@@ -773,8 +773,10 @@ func runReposInstall(ctx context.Context, opts *reposInstallConfig) error {
 	// The configuration preflights below only read the forge, and the
 	// manifest is written only after all of them, so they share one read
 	// cache: equivalent layer, component and glob reads are made once
-	// (#8501). It is discarded before the manifest write; convergence
-	// reads current state through clients.
+	// (#8501). Convergence reads current state through clients, but it
+	// acts only on the repositories the preflights selected from this
+	// cache's org listings: a repository a glob matches only in a later
+	// listing passed none of the preflights, so it is skipped.
 	preflightClients := repos.NewPreflightReadCache(clients)
 
 	// Preflight the existing configuration layers of manifest-tracked repos
@@ -1049,6 +1051,7 @@ func runReposInstall(ctx context.Context, opts *reposInstallConfig) error {
 		DryRun:                  opts.dryRun,
 		RepoFilter:              opts.repoFilter,
 		ExcludeRepos:            append(containFailedKeys(containFailedRepos), skipped...),
+		PreflightListing:        preflightClients,
 		MaxConcurrency:          opts.concurrency,
 		UpstreamRef:             upstreamRef,
 		UpstreamTag:             upstreamTag,

@@ -29,8 +29,17 @@ type ConvergeConfig struct {
 	// ExcludeRepos lists owner/repo names (case-insensitive) that Converge
 	// skips entirely, such as repos whose GitLab trigger-account containment
 	// failed: they take no scaffold, config, variable, or schedule write.
-	ExcludeRepos   []string
-	MaxConcurrency int
+	ExcludeRepos []string
+	// PreflightListing, when set, is the factory whose org repository
+	// listings the caller's configuration preflights expanded glob entries
+	// with (repos install passes its preflight read cache, #8501). Converge
+	// then acts only on repositories that selection contains: one that a
+	// glob matches only in the live listing, such as a repository created
+	// after the preflights, passed none of them, so it is skipped with a
+	// warning and takes no write. Only glob expansion reads through it;
+	// every other read uses the clients passed to Converge.
+	PreflightListing ForgeClientFactory
+	MaxConcurrency   int
 
 	// UpstreamRef is the git ref (SHA) used to pin scaffold workflow refs.
 	UpstreamRef string
@@ -252,6 +261,33 @@ func (r *ConvergeBatchResult) Failed() []ConvergeResult {
 		}
 	}
 	return out
+}
+
+// withoutUnevaluatedRepos returns repos minus every repository that the
+// selection the configuration preflights made from listing does not
+// contain. Each such repository (a glob match that first appeared in the
+// live listing) is reported through progress as skipped, so the operator
+// can run install again for it.
+func withoutUnevaluatedRepos(ctx context.Context, m *Manifest, listing ForgeClientFactory, filter []string, repos []ResolvedRepo, progress ProgressFunc) ([]ResolvedRepo, error) {
+	evaluated, err := selectManifestRepos(ctx, m, listing, filter)
+	if err != nil {
+		return nil, fmt.Errorf("expanding globs from the preflight listing: %w", err)
+	}
+	seen := make(map[string]bool, len(evaluated))
+	for _, rr := range evaluated {
+		seen[strings.ToLower(rr.Owner+"/"+rr.Repo)] = true
+	}
+	kept := make([]ResolvedRepo, 0, len(repos))
+	for _, rr := range repos {
+		name := rr.Owner + "/" + rr.Repo
+		if seen[strings.ToLower(name)] {
+			kept = append(kept, rr)
+			continue
+		}
+		progress(name, "warning", "skipped: this repository appeared after the configuration preflights listed "+
+			rr.Owner+", so it passed none of them; nothing was written. Run repos install again to install it")
+	}
+	return kept, nil
 }
 
 func validateConcurrency(n int) error {
@@ -812,6 +848,12 @@ func Converge(ctx context.Context, cfg ConvergeConfig,
 		// Every selector must select a declared repository, before any
 		// probe or write (#8219).
 		repos, err = selectDeclaredRepos(manifest, repos, cfg.RepoFilter)
+		if err != nil {
+			return nil, err
+		}
+	}
+	if cfg.PreflightListing != nil {
+		repos, err = withoutUnevaluatedRepos(ctx, manifest, cfg.PreflightListing, cfg.RepoFilter, repos, progress)
 		if err != nil {
 			return nil, err
 		}
