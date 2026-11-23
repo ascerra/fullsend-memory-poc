@@ -1801,8 +1801,20 @@ func runReposUninstall(ctx context.Context, opts *reposUninstallConfig, repoArgs
 
 	// Manifest removal phase (skipped when --uninstall-only).
 	if !opts.uninstallOnly && len(succeededRepos) > 0 {
+		removeFrom := manifest
+		if !opts.dryRun {
+			current, reloadErr := manifestForRemoval(ctx, opts.manifest, manifest)
+			if reloadErr != nil {
+				if opts.manifestOnly {
+					return reloadErr
+				}
+				return fmt.Errorf("%w; %s were torn down and are still in the manifest: once it loads, run repos uninstall --manifest-only %s to remove them",
+					reloadErr, strings.Join(succeededRepos, ", "), strings.Join(succeededRepos, " "))
+			}
+			removeFrom = current
+		}
 		removeResult, _, removeErr := repos.RemoveFromManifest(repos.ManifestEditConfig{
-			Manifest:     manifest,
+			Manifest:     removeFrom,
 			ManifestPath: opts.manifest,
 			DryRun:       opts.dryRun,
 		}, succeededRepos, progressFn)
@@ -1826,6 +1838,36 @@ func runReposUninstall(ctx context.Context, opts *reposUninstallConfig, repoArgs
 		return fmt.Errorf("%d repos failed to uninstall", teardownFailed)
 	}
 	return nil
+}
+
+// manifestForRemoval returns the manifest that uninstall removes the
+// torn-down repos from. Another command that uses the same file, such as a
+// repos install of another repository, may have rewritten it since this run
+// loaded it; removing the entries from the copy loaded before the teardown
+// would drop its edits, such as a first-install tracker default or a
+// trace_context. So when the file changed, it is loaded again and the
+// removal applies to what it holds now. A read-only manifest is returned as
+// it is, for the write to refuse. The comparison and the write are not
+// atomic: a write that lands between them is overwritten, as with install.
+func manifestForRemoval(ctx context.Context, path string, loaded *repos.Manifest) (*repos.Manifest, error) {
+	if repos.ManifestReadOnly(loaded, path) {
+		return loaded, nil
+	}
+	current, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("writing manifest: reading %s again before writing it: %w", path, err)
+	}
+	if bytes.Equal(current, loaded.LoadedBytes()) {
+		return loaded, nil
+	}
+	reloaded, err := repos.LoadManifest(ctx, path)
+	if err != nil {
+		return nil, fmt.Errorf("writing manifest: loading %s again, which changed after this run loaded it: %w", path, err)
+	}
+	if err := reloaded.ValidateForUninstall(); err != nil {
+		return nil, fmt.Errorf("writing manifest: %s changed after this run loaded it and no longer validates: %w", path, err)
+	}
+	return reloaded, nil
 }
 
 // confirmBulkAction prompts for confirmation when a destructive action targets
