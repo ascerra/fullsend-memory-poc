@@ -6,6 +6,7 @@ import (
 	"io/fs"
 	"maps"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -330,9 +331,56 @@ func TestRunReposUninstall_ManifestUnusableAfterTeardownIsReported(t *testing.T)
 			}
 			assert.Contains(t, err.Error(), tc.wantMsg)
 			assert.Contains(t, err.Error(), "acme/api were torn down and are still in the manifest")
-			assert.Contains(t, err.Error(), "repos uninstall --manifest-only acme/api")
+			assert.Contains(t, err.Error(), "repos uninstall -f "+manifestPath+" --manifest-only acme/api")
 		})
 	}
+}
+
+// The --manifest-only retry printed after a teardown passes the same -f path
+// as the run, quoted when a shell would split or expand it. Running it as
+// printed removes the torn-down entry from that manifest.
+func TestUninstallRemovalManifest_RetryHintNamesManifest(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		file     string
+		wantFlag func(path string) string
+	}{
+		{"plain path", "other.yaml", func(path string) string { return "-f " + path + " " }},
+		{"path with a space", "my repos.yaml", func(path string) string { return "-f " + shellQuote(path) + " " }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			manifestPath := filepath.Join(t.TempDir(), tc.file)
+			require.NoError(t, os.WriteFile(manifestPath, []byte(twoRepoManifestYAML), 0o644))
+			loaded, err := repos.LoadManifest(context.Background(), manifestPath)
+			require.NoError(t, err)
+			require.NoError(t, os.WriteFile(manifestPath, []byte("version: [\n"), 0o644))
+
+			_, err = uninstallRemovalManifest(context.Background(), uninstallOpts(manifestPath, nil), loaded, []string{"acme/api"})
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), "run repos uninstall "+tc.wantFlag(manifestPath)+"--manifest-only acme/api to remove them")
+
+			// Once the file loads again, the printed command removes the entry from it.
+			require.NoError(t, os.WriteFile(manifestPath, []byte(twoRepoManifestYAML), 0o644))
+			opts := uninstallOpts(manifestPath, newInstalledFakeClientCLI("acme/api", "acme/web"))
+			opts.manifestOnly = true
+			captureStdout(t, func() {
+				err = runReposUninstall(context.Background(), opts, []string{"acme/api"})
+			})
+			require.NoError(t, err)
+			final := mustReadFile(t, manifestPath)
+			assert.NotContains(t, final, "acme/api")
+			assert.Contains(t, final, "acme/web")
+		})
+	}
+}
+
+func TestManifestFlagForRetry(t *testing.T) {
+	assert.Equal(t, "", manifestFlagForRetry("repos.yaml"))
+	assert.Equal(t, "", manifestFlagForRetry(""))
+	assert.Equal(t, "-f /tmp/other.yaml ", manifestFlagForRetry("/tmp/other.yaml"))
+	assert.Equal(t, "-f ./repos.yaml ", manifestFlagForRetry("./repos.yaml"))
+	assert.Equal(t, `-f '/tmp/it'\''s here.yaml' `, manifestFlagForRetry("/tmp/it's here.yaml"))
+	assert.Equal(t, "-f '/tmp/$HOME.yaml' ", manifestFlagForRetry("/tmp/$HOME.yaml"))
 }
 
 // An uninstall whose repos.yaml is unchanged since it loaded it removes the

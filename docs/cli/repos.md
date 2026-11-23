@@ -1816,7 +1816,9 @@ teardown, uninstall loads the file again and removes the entries from what it
 holds now, so that command's edits, such as a first-install `tracker` default
 or a `trace_context`, are kept. When the file can no longer be read, loaded or
 validated, uninstall stops without writing it and names the torn-down repos;
-remove them with `repos uninstall --manifest-only` once the file loads.
+remove them with `repos uninstall --manifest-only` once the file loads. The
+printed command passes the same `-f` path as the uninstall when it used a
+manifest other than the default `repos.yaml`.
 Uninstall still overwrites a change that lands in the short window between
 that check and the write. `--dry-run` does not read the file again.
 
