@@ -3,7 +3,6 @@ package repos
 import (
 	"context"
 	"strings"
-	"sync"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -12,43 +11,15 @@ import (
 	"github.com/fullsend-ai/fullsend/internal/forge"
 )
 
-// repoScaffoldCommit records the repositories that received a scaffold
-// commit.
-type repoScaffoldCommit struct {
-	mu    sync.Mutex
-	repos []string
-}
-
-func (s *repoScaffoldCommit) fn() ScaffoldCommitFunc {
-	return func(_ context.Context, owner, repo string, _ []forge.TreeFile, _ bool, _ bool) error {
-		s.mu.Lock()
-		s.repos = append(s.repos, owner+"/"+repo)
-		s.mu.Unlock()
-		return nil
-	}
-}
-
-// progressRecorder records progress messages per repository and phase.
-type progressRecorder struct {
-	mu       sync.Mutex
-	messages map[string][]string
-}
-
-func (p *progressRecorder) fn() ProgressFunc {
-	return func(repo, phase, msg string) {
-		p.mu.Lock()
-		defer p.mu.Unlock()
-		if p.messages == nil {
-			p.messages = make(map[string][]string)
+// progressLines returns the messages p collected for repo in phase.
+func progressLines(p *progressLog, repo, phase string) []string {
+	var out []string
+	for _, line := range p.all() {
+		if msg, ok := strings.CutPrefix(line, repo+" "+phase+" "); ok {
+			out = append(out, msg)
 		}
-		p.messages[repo+"|"+phase] = append(p.messages[repo+"|"+phase], msg)
 	}
-}
-
-func (p *progressRecorder) get(repo, phase string) []string {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	return p.messages[repo+"|"+phase]
+	return out
 }
 
 // writesTo reports whether fc recorded any secret or variable write for
@@ -96,10 +67,10 @@ func TestConverge_PreflightListingSkipsRepoCreatedAfterPreflights(t *testing.T) 
 			cfg := convergeCfgWithDefaults(m)
 			cfg.DryRun = dryRun
 			cfg.PreflightListing = preflight
-			sc := &repoScaffoldCommit{}
-			progress := &progressRecorder{}
+			sc := &recordingScaffoldCommit{}
+			progress := &progressLog{}
 
-			result, err := Converge(ctx, cfg, clients, sc.fn(), progress.fn())
+			result, err := Converge(ctx, cfg, clients, sc.fn(), progress.fn)
 			require.NoError(t, err)
 
 			require.Len(t, result.Results, 1)
@@ -112,7 +83,7 @@ func TestConverge_PreflightListingSkipsRepoCreatedAfterPreflights(t *testing.T) 
 				assert.True(t, writesTo(fc, "acme/api"))
 			}
 
-			warnings := progress.get("acme/web", "warning")
+			warnings := progressLines(progress, "acme/web", "warning")
 			require.Len(t, warnings, 1)
 			assert.Contains(t, warnings[0], "skipped")
 			assert.Contains(t, warnings[0], "Run repos install again")
@@ -139,14 +110,14 @@ func TestConverge_PreflightListingKeepsFilterNamedGlobRepo(t *testing.T) {
 	cfg := convergeCfgWithDefaults(m)
 	cfg.RepoFilter = filter
 	cfg.PreflightListing = preflight
-	sc := &repoScaffoldCommit{}
-	progress := &progressRecorder{}
+	sc := &recordingScaffoldCommit{}
+	progress := &progressLog{}
 
-	result, err := Converge(ctx, cfg, clients, sc.fn(), progress.fn())
+	result, err := Converge(ctx, cfg, clients, sc.fn(), progress.fn)
 	require.NoError(t, err)
 	require.Len(t, result.Results, 1)
 	assert.Equal(t, "acme/web", result.Results[0].Owner+"/"+result.Results[0].Repo)
-	assert.Empty(t, progress.get("acme/web", "warning"))
+	assert.Empty(t, progressLines(progress, "acme/web", "warning"))
 }
 
 // A repository that disappears after the preflights is not converged, and
@@ -172,13 +143,50 @@ func TestConverge_PreflightListingWithRemovedAndExcludedRepos(t *testing.T) {
 	cfg := convergeCfgWithDefaults(m)
 	cfg.ExcludeRepos = []string{"acme/web"}
 	cfg.PreflightListing = preflight
-	sc := &repoScaffoldCommit{}
+	sc := &recordingScaffoldCommit{}
 
 	result, err := Converge(ctx, cfg, clients, sc.fn(), noopProgress)
 	require.NoError(t, err)
 	require.Len(t, result.Results, 1)
 	assert.Equal(t, "acme/api", result.Results[0].Owner+"/"+result.Results[0].Repo)
 	assert.Equal(t, []string{"acme/api"}, sc.repos)
+}
+
+// A repository skipped because the preflights did not evaluate it still
+// counts as a credential consumer, as an excluded one does: when it is the
+// only repository that uses a supplied --openai-api-key, the run is not
+// failed for the evaluated repositories (#18).
+func TestConverge_PreflightListingSkippedRepoCountsAsCredentialConsumer(t *testing.T) {
+	ctx := context.Background()
+	fc := newFakeClientForBatch("acme/api")
+	m := newConvergeManifest("acme/api", "acme/web-*")
+	m.GitHub.Repos[1].Inference = InferenceSettings{Auth: InferenceAuthOpenAIAPIKey}
+	clients := newTestClientFactory(fc)
+
+	preflight := NewPreflightReadCache(clients)
+	evaluated, err := selectManifestRepos(ctx, m, preflight, nil)
+	require.NoError(t, err)
+	require.Len(t, evaluated, 1)
+
+	addListedRepo(fc, "acme/web-new")
+
+	cfg := convergeCfgWithDefaults(m)
+	cfg.DryRun = true
+	cfg.OpenAIAPIKey = testOpenAIAPIKey
+	cfg.PreflightListing = preflight
+	progress := &progressLog{}
+
+	result, err := Converge(ctx, cfg, clients, nil, progress.fn)
+	require.NoError(t, err)
+	require.Len(t, result.Results, 1)
+	assert.Equal(t, "acme/api", result.Results[0].Owner+"/"+result.Results[0].Repo)
+	assert.Len(t, progressLines(progress, "acme/web-new", "warning"), 1)
+
+	// Without the skipped consumer, the supplied key is still rejected.
+	cfg.PreflightListing = NewPreflightReadCache(newTestClientFactory(newFakeClientForBatch("acme/api")))
+	fc2 := newFakeClientForBatch("acme/api")
+	_, err = Converge(ctx, cfg, newTestClientFactory(fc2), nil, noopProgress)
+	require.ErrorContains(t, err, "--openai-api-key was supplied but no selected repository uses")
 }
 
 // Without a preflight listing, Converge expands globs from the live listing
@@ -189,7 +197,7 @@ func TestConverge_NoPreflightListingUsesLiveListing(t *testing.T) {
 	m := newConvergeManifest("acme/*")
 	addListedRepo(fc, "acme/web")
 
-	result, err := Converge(ctx, convergeCfgWithDefaults(m), newTestClientFactory(fc), (&repoScaffoldCommit{}).fn(), noopProgress)
+	result, err := Converge(ctx, convergeCfgWithDefaults(m), newTestClientFactory(fc), (&recordingScaffoldCommit{}).fn(), noopProgress)
 	require.NoError(t, err)
 	assert.Len(t, result.Results, 2)
 }
@@ -203,7 +211,7 @@ func TestConverge_PreflightListingErrorFailsBeforeWrites(t *testing.T) {
 
 	cfg := convergeCfgWithDefaults(m)
 	cfg.PreflightListing = newTestClientFactory(failingOrgClient{FakeClient: fc, failOrg: "acme"})
-	sc := &repoScaffoldCommit{}
+	sc := &recordingScaffoldCommit{}
 
 	_, err := Converge(ctx, cfg, newTestClientFactory(fc), sc.fn(), noopProgress)
 	require.ErrorContains(t, err, "expanding globs from the preflight listing")

@@ -263,12 +263,12 @@ func (r *ConvergeBatchResult) Failed() []ConvergeResult {
 	return out
 }
 
-// withoutUnevaluatedRepos returns repos minus every repository that the
+// unevaluatedRepos returns the names of the repositories in repos that the
 // selection the configuration preflights made from listing does not
 // contain. Each such repository (a glob match that first appeared in the
 // live listing) is reported through progress as skipped, so the operator
 // can run install again for it.
-func withoutUnevaluatedRepos(ctx context.Context, m *Manifest, listing ForgeClientFactory, filter []string, repos []ResolvedRepo, progress ProgressFunc) ([]ResolvedRepo, error) {
+func unevaluatedRepos(ctx context.Context, m *Manifest, listing ForgeClientFactory, filter []string, repos []ResolvedRepo, progress ProgressFunc) ([]string, error) {
 	evaluated, err := selectManifestRepos(ctx, m, listing, filter)
 	if err != nil {
 		return nil, fmt.Errorf("expanding globs from the preflight listing: %w", err)
@@ -277,17 +277,17 @@ func withoutUnevaluatedRepos(ctx context.Context, m *Manifest, listing ForgeClie
 	for _, rr := range evaluated {
 		seen[strings.ToLower(rr.Owner+"/"+rr.Repo)] = true
 	}
-	kept := make([]ResolvedRepo, 0, len(repos))
+	var unevaluated []string
 	for _, rr := range repos {
 		name := rr.Owner + "/" + rr.Repo
 		if seen[strings.ToLower(name)] {
-			kept = append(kept, rr)
 			continue
 		}
+		unevaluated = append(unevaluated, name)
 		progress(name, "warning", "skipped: this repository appeared after the configuration preflights listed "+
 			rr.Owner+", so it passed none of them; nothing was written. Run repos install again to install it")
 	}
-	return kept, nil
+	return unevaluated, nil
 }
 
 func validateConcurrency(n int) error {
@@ -852,17 +852,22 @@ func Converge(ctx context.Context, cfg ConvergeConfig,
 			return nil, err
 		}
 	}
+	excludeRepos := cfg.ExcludeRepos
 	if cfg.PreflightListing != nil {
-		repos, err = withoutUnevaluatedRepos(ctx, manifest, cfg.PreflightListing, cfg.RepoFilter, repos, progress)
+		unevaluated, err := unevaluatedRepos(ctx, manifest, cfg.PreflightListing, cfg.RepoFilter, repos, progress)
 		if err != nil {
 			return nil, err
 		}
+		// A repository the preflights did not evaluate is skipped the way
+		// an excluded one is: it takes no write but still counts as a
+		// credential consumer below.
+		excludeRepos = append(slices.Clip(excludeRepos), unevaluated...)
 	}
 	store := newPresetCache()
 	excludedUsesOpenAI, excludedUsesVertex, excludedUsesJira := false, false, false
-	if len(cfg.ExcludeRepos) > 0 {
-		excluded := make(map[string]bool, len(cfg.ExcludeRepos))
-		for _, name := range cfg.ExcludeRepos {
+	if len(excludeRepos) > 0 {
+		excluded := make(map[string]bool, len(excludeRepos))
+		for _, name := range excludeRepos {
 			excluded[strings.ToLower(name)] = true
 		}
 		kept := make([]ResolvedRepo, 0, len(repos))

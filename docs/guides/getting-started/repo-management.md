@@ -915,7 +915,8 @@ glob, when it writes that repository's first-install `tracker` default or, on
 GitHub, its `trace_context` block
 ([Trace signing keys](../../cli/repos.md#trace-signing-keys)) to `repos.yaml`.
 Edits to the glob entry apply only to repositories that have no entry of their
-own.
+own. A glob-covered repository created while install runs is skipped with a
+warning; run `repos install` again to install it.
 
 Per-repo settings live on the entry, never in install flags:
 `fullsend_ref`, `mint_url`, `app_set`, `inference.auth`, `vendor`,
