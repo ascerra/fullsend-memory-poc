@@ -253,6 +253,13 @@ first-install `tracker` default or, on GitHub, the `trace_context` block to
 `repos.yaml`. Edits to the glob entry do not apply to a repository that has
 its own entry. To give it different settings, declare an explicit entry.
 
+Install expands glob entries from the org listing it reads during its
+configuration checks, and converges only the repositories found there. A
+repository a glob matches only in a later listing, such as one created while
+install runs, passed none of those checks: install skips it with a warning,
+writes nothing to it and gives it no trace signing key. It still counts as a
+consumer of the credential flags. Run `repos install` again to install it.
+
 Credentials are required only for the forges of the selected repos: a GitLab-only selection does not need `GH_TOKEN`, and a GitHub-only selection does not need `GITLAB_TOKEN`. An unfiltered run still requires credentials for every forge present in the manifest.
 
 Install writes to `repos.yaml` itself in only four cases: the first-install
