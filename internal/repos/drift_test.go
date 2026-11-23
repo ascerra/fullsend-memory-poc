@@ -299,6 +299,36 @@ func TestCheckOrphanVars_PerRepoGuardVarFlaggedAsOrphan(t *testing.T) {
 	}
 }
 
+// On GitLab the Jira polling credentials are masked CI/CD variables, so the
+// variable listing returns them. They are written by install, not orphans,
+// whether or not tracker.jira polling is enabled.
+func TestCheckOrphanVars_GitLabJiraCredentialsNotFlagged(t *testing.T) {
+	fc := forge.NewFakeClient()
+	for _, name := range []string{
+		forge.SecretJiraToken,
+		forge.SecretJiraEmail,
+		forge.SecretJiraClientID,
+		forge.SecretJiraClientSecret,
+	} {
+		fc.VariableValues["group/project/"+name] = "value"
+	}
+	fc.VariableValues["group/project/FULLSEND_SOMETHING_ELSE"] = "value"
+
+	orphans, err := CheckOrphanVars(
+		context.Background(), fc, "group", "project",
+		InstallConfig{Forge: ForgeGitLab}, "",
+	)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(orphans) != 1 {
+		t.Fatalf("expected 1 orphan var, got %d: %v", len(orphans), orphans)
+	}
+	if orphans[0].Name != "FULLSEND_SOMETHING_ELSE" {
+		t.Errorf("orphan name = %q, want %q", orphans[0].Name, "FULLSEND_SOMETHING_ELSE")
+	}
+}
+
 func TestCheckOrphanVars_IgnoresNonFullsendVars(t *testing.T) {
 	fc := forge.NewFakeClient()
 	fc.VariableValues["owner/repo/"+forge.VarMintURL] = "https://mint.example.com"
