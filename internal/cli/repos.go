@@ -1847,10 +1847,26 @@ func uninstallRemovalManifest(ctx context.Context, opts *reposUninstallConfig, l
 		if opts.manifestOnly {
 			return nil, err
 		}
-		return nil, fmt.Errorf("%w; %s were torn down and are still in the manifest: once it loads, run repos uninstall --manifest-only %s to remove them",
-			err, strings.Join(tornDown, ", "), strings.Join(tornDown, " "))
+		return nil, fmt.Errorf("%w; %s were torn down and are still in the manifest: once it loads, run repos uninstall %s--manifest-only %s to remove them",
+			err, strings.Join(tornDown, ", "), manifestFlagForRetry(opts.manifest), strings.Join(tornDown, " "))
 	}
 	return current, nil
+}
+
+// manifestFlagForRetry returns the -f argument, with a trailing space, that a
+// printed retry command needs so that it edits the same manifest as this run.
+// It is empty for the default repos.yaml. A path with characters a shell
+// would interpret is single-quoted.
+func manifestFlagForRetry(manifest string) string {
+	if manifest == "" || manifest == "repos.yaml" {
+		return ""
+	}
+	if strings.IndexFunc(manifest, func(r rune) bool {
+		return !(r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || strings.ContainsRune("-_./:@%+=,", r))
+	}) >= 0 {
+		manifest = shellQuote(manifest)
+	}
+	return "-f " + manifest + " "
 }
 
 // manifestChangedSinceLoad reports whether the manifest file at path no
