@@ -953,11 +953,11 @@ func runReposInstall(ctx context.Context, opts *reposInstallConfig) error {
 		// leaves it unwritten), so the file here is a local regular file. The
 		// comparison and the write are not atomic: a write that lands between
 		// them is overwritten. Lock the file if that window matters.
-		current, readErr := os.ReadFile(opts.manifest)
+		changedOnDisk, readErr := manifestChangedSinceLoad(opts.manifest, manifest)
 		if readErr != nil {
-			return fmt.Errorf("writing manifest: reading %s again before writing it: %w", opts.manifest, readErr)
+			return readErr
 		}
-		if !bytes.Equal(current, manifest.LoadedBytes()) {
+		if changedOnDisk {
 			return fmt.Errorf("writing manifest: %s changed after this run loaded it, as when another repos install that uses the same file runs at the same time; "+
 				"this run stopped before writing it: run install again once the other install has finished", opts.manifest)
 		}
@@ -1801,17 +1801,9 @@ func runReposUninstall(ctx context.Context, opts *reposUninstallConfig, repoArgs
 
 	// Manifest removal phase (skipped when --uninstall-only).
 	if !opts.uninstallOnly && len(succeededRepos) > 0 {
-		removeFrom := manifest
-		if !opts.dryRun {
-			current, reloadErr := manifestForRemoval(ctx, opts.manifest, manifest)
-			if reloadErr != nil {
-				if opts.manifestOnly {
-					return reloadErr
-				}
-				return fmt.Errorf("%w; %s were torn down and are still in the manifest: once it loads, run repos uninstall --manifest-only %s to remove them",
-					reloadErr, strings.Join(succeededRepos, ", "), strings.Join(succeededRepos, " "))
-			}
-			removeFrom = current
+		removeFrom, reloadErr := uninstallRemovalManifest(ctx, opts, manifest, succeededRepos)
+		if reloadErr != nil {
+			return reloadErr
 		}
 		removeResult, _, removeErr := repos.RemoveFromManifest(repos.ManifestEditConfig{
 			Manifest:     removeFrom,
@@ -1840,6 +1832,39 @@ func runReposUninstall(ctx context.Context, opts *reposUninstallConfig, repoArgs
 	return nil
 }
 
+// uninstallRemovalManifest returns the manifest that the removal phase of
+// uninstall edits. A dry run uses the loaded copy and does not read the file
+// again. Otherwise it is the one manifestForRemoval returns; when that fails
+// after a teardown, the error names the torn-down repos and the
+// --manifest-only retry. With --manifest-only nothing was torn down, so the
+// error is returned as it is.
+func uninstallRemovalManifest(ctx context.Context, opts *reposUninstallConfig, loaded *repos.Manifest, tornDown []string) (*repos.Manifest, error) {
+	if opts.dryRun {
+		return loaded, nil
+	}
+	current, err := manifestForRemoval(ctx, opts.manifest, loaded)
+	if err != nil {
+		if opts.manifestOnly {
+			return nil, err
+		}
+		return nil, fmt.Errorf("%w; %s were torn down and are still in the manifest: once it loads, run repos uninstall --manifest-only %s to remove them",
+			err, strings.Join(tornDown, ", "), strings.Join(tornDown, " "))
+	}
+	return current, nil
+}
+
+// manifestChangedSinceLoad reports whether the manifest file at path no
+// longer holds the bytes this run loaded, as when another command that uses
+// the same file rewrote it. Install and uninstall check this before writing
+// the file.
+func manifestChangedSinceLoad(path string, loaded *repos.Manifest) (bool, error) {
+	current, err := os.ReadFile(path)
+	if err != nil {
+		return false, fmt.Errorf("writing manifest: reading %s again before writing it: %w", path, err)
+	}
+	return !bytes.Equal(current, loaded.LoadedBytes()), nil
+}
+
 // manifestForRemoval returns the manifest that uninstall removes the
 // torn-down repos from. Another command that uses the same file, such as a
 // repos install of another repository, may have rewritten it since this run
@@ -1853,11 +1878,11 @@ func manifestForRemoval(ctx context.Context, path string, loaded *repos.Manifest
 	if repos.ManifestReadOnly(loaded, path) {
 		return loaded, nil
 	}
-	current, err := os.ReadFile(path)
+	changed, err := manifestChangedSinceLoad(path, loaded)
 	if err != nil {
-		return nil, fmt.Errorf("writing manifest: reading %s again before writing it: %w", path, err)
+		return nil, err
 	}
-	if bytes.Equal(current, loaded.LoadedBytes()) {
+	if !changed {
 		return loaded, nil
 	}
 	reloaded, err := repos.LoadManifest(ctx, path)

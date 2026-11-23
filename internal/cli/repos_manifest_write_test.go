@@ -310,10 +310,10 @@ func TestRunReposUninstall_ManifestUnusableAfterTeardownIsReported(t *testing.T)
 		{"deleted", func(t *testing.T, path string) { require.NoError(t, os.Remove(path)) }, fs.ErrNotExist, "reading"},
 		{"unparsable", func(t *testing.T, path string) {
 			require.NoError(t, os.WriteFile(path, []byte("version: [\n"), 0o644))
-		}, nil, "changed after this run loaded it"},
+		}, nil, "again, which changed after this run loaded it: parsing manifest YAML"},
 		{"invalid", func(t *testing.T, path string) {
 			require.NoError(t, os.WriteFile(path, []byte(strings.Replace(twoRepoManifestYAML, "version: 1", "version: 99", 1)), 0o644))
-		}, nil, "changed after this run loaded it"},
+		}, nil, "changed after this run loaded it and no longer validates: unsupported manifest version 99"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			manifestPath := writeTestManifest(t, twoRepoManifestYAML)
@@ -348,4 +348,61 @@ func TestRunReposUninstall_ManifestUnchangedRemovesEntry(t *testing.T) {
 	final := mustReadFile(t, manifestPath)
 	assert.NotContains(t, final, "acme/api")
 	assert.Contains(t, final, "acme/web")
+}
+
+// scopeCheckHookClient runs another command the first time the uninstall
+// checks its token, which a dry run does too: after it loaded repos.yaml and
+// before its manifest removal phase.
+type scopeCheckHookClient struct {
+	*forge.FakeClient
+	other func()
+}
+
+func (c *scopeCheckHookClient) IsInstallationToken(ctx context.Context) (bool, error) {
+	if f := c.other; f != nil {
+		c.other = nil
+		f()
+	}
+	return c.FakeClient.IsInstallationToken(ctx)
+}
+
+// A dry-run uninstall does not read repos.yaml again, so a file that no
+// longer loads after it loaded it fails nothing, and it is not written.
+func TestRunReposUninstall_DryRunDoesNotReadManifestAgain(t *testing.T) {
+	const broken = "version: [\n"
+	manifestPath := writeTestManifest(t, twoRepoManifestYAML)
+	fc := newInstalledFakeClientCLI("acme/api", "acme/web")
+	hooked := false
+	client := &scopeCheckHookClient{FakeClient: fc, other: func() {
+		hooked = true
+		require.NoError(t, os.WriteFile(manifestPath, []byte(broken), 0o644))
+	}}
+	opts := uninstallOpts(manifestPath, client)
+	opts.dryRun = true
+
+	var err error
+	captureStdout(t, func() {
+		err = runReposUninstall(context.Background(), opts, []string{"acme/api"})
+	})
+	require.True(t, hooked, "the file changed during the run")
+	require.NoError(t, err)
+	assert.Equal(t, broken, mustReadFile(t, manifestPath), "the dry run does not write the file")
+}
+
+// With --manifest-only nothing is torn down, so a repos.yaml that no longer
+// validates when the removal reads it again is reported without the advice
+// about torn-down repos.
+func TestUninstallRemovalManifest_ManifestOnlyReportsReloadErrorAsIs(t *testing.T) {
+	manifestPath := writeTestManifest(t, twoRepoManifestYAML)
+	loaded, err := repos.LoadManifest(context.Background(), manifestPath)
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(manifestPath, []byte(strings.Replace(twoRepoManifestYAML, "version: 1", "version: 99", 1)), 0o644))
+
+	opts := uninstallOpts(manifestPath, nil)
+	opts.manifestOnly = true
+	_, err = uninstallRemovalManifest(context.Background(), opts, loaded, []string{"acme/api"})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "no longer validates")
+	assert.NotContains(t, err.Error(), "were torn down")
+	assert.NotContains(t, err.Error(), "--manifest-only")
 }
