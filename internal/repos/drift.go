@@ -247,6 +247,16 @@ func CheckOrphanVars(ctx context.Context, client forge.Client,
 		// Fullsend reserves the trace signing key's name (ADR 0154). The
 		// variable listing returns it, but it is managed, not an orphan.
 		managedNames[forge.SecretTraceSigningKey] = true
+		// Jira polling credentials are written by the poll reconciler
+		// (convergeJiraPoll), outside installSecretsForForge, as masked
+		// CI/CD variables. Install keeps them while polling is disabled, so
+		// they are managed whether or not tracker.jira polling is enabled.
+		// On GitHub they are Actions secrets, which the variable listing
+		// never returns, so a FULLSEND_JIRA_* variable there is a plaintext
+		// one install did not write and is still reported.
+		for _, name := range jiraManagedSecrets {
+			managedNames[name] = true
+		}
 		for _, name := range gitlabRetiredLegacyVars {
 			managedNames[name] = true
 		}
