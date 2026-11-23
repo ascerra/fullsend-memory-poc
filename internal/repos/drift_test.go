@@ -329,6 +329,30 @@ func TestCheckOrphanVars_GitLabJiraCredentialsNotFlagged(t *testing.T) {
 	}
 }
 
+// On GitHub install writes the Jira credentials as Actions secrets, which the
+// variable listing never returns. A FULLSEND_JIRA_TOKEN repo variable there is
+// a plaintext credential install did not write, so it is still an orphan.
+func TestCheckOrphanVars_GitHubPlaintextJiraTokenFlagged(t *testing.T) {
+	fc := forge.NewFakeClient()
+	fc.VariableValues["owner/repo/"+forge.VarMintURL] = "https://mint.example.com"
+	fc.VariableValues["owner/repo/"+forge.SecretJiraToken] = "value"
+
+	cfg := InstallConfig{Forge: ForgeGitHub, MintURL: "https://mint.example.com"}
+	orphans, err := CheckOrphanVars(
+		context.Background(), fc, "owner", "repo",
+		cfg, "https://mint.example.com",
+	)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(orphans) != 1 {
+		t.Fatalf("expected 1 orphan var, got %d: %v", len(orphans), orphans)
+	}
+	if orphans[0].Name != forge.SecretJiraToken {
+		t.Errorf("orphan name = %q, want %q", orphans[0].Name, forge.SecretJiraToken)
+	}
+}
+
 func TestCheckOrphanVars_IgnoresNonFullsendVars(t *testing.T) {
 	fc := forge.NewFakeClient()
 	fc.VariableValues["owner/repo/"+forge.VarMintURL] = "https://mint.example.com"
