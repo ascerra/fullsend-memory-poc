@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io/fs"
+	"maps"
 	"os"
 	"strings"
 	"testing"
@@ -216,4 +217,192 @@ func TestRunReposUninstall_ReadOnlyManifest(t *testing.T) {
 			})
 		}
 	}
+}
+
+// teardownHookClient runs another command the first time the uninstall
+// deletes a repository variable, which is during its teardown: after it
+// loaded repos.yaml and before it removes the torn-down entries from it.
+type teardownHookClient struct {
+	*forge.FakeClient
+	other func()
+}
+
+func (c *teardownHookClient) DeleteRepoVariable(ctx context.Context, owner, repo, name string) error {
+	if f := c.other; f != nil {
+		c.other = nil
+		f()
+	}
+	return c.FakeClient.DeleteRepoVariable(ctx, owner, repo, name)
+}
+
+// newUninstallAndInstallFakeClient returns a client on which acme/api is
+// installed, for the uninstall, and acme/web is not, for an install.
+func newUninstallAndInstallFakeClient() *forge.FakeClient {
+	fc := newInstallFakeClient("acme/api", "acme/web")
+	installed := newInstalledFakeClientCLI("acme/api")
+	maps.Copy(fc.VariableValues, installed.VariableValues)
+	maps.Copy(fc.Secrets, installed.Secrets)
+	maps.Copy(fc.FileContents, installed.FileContents)
+	return fc
+}
+
+func uninstallOpts(manifestPath string, client forge.Client) *reposUninstallConfig {
+	return &reposUninstallConfig{
+		manifest:    manifestPath,
+		yes:         true,
+		direct:      true,
+		concurrency: 1,
+		testClient:  client,
+	}
+}
+
+// An uninstall whose repos.yaml another command rewrote during the teardown
+// removes the torn-down entry from the file as it is now, not from the copy
+// it loaded, so the other command's edits survive: here an install of
+// acme/web records its first-install tracker default and trace_context.
+func TestRunReposUninstall_ManifestChangedMeanwhileKeepsOtherEdits(t *testing.T) {
+	const target = "- fullsend-ai/fullsend\n"
+	manifestPath := writeTestManifest(t, twoRepoManifestYAML)
+	fc := newUninstallAndInstallFakeClient()
+	var otherFile string
+	var otherErr error
+	client := &teardownHookClient{FakeClient: fc, other: func() {
+		opts := githubManagedInstallOpts(manifestPath, fc)
+		opts.repoFilter = []string{"acme/web"}
+		otherErr = runReposInstall(context.Background(), opts)
+		otherFile = mustReadFile(t, manifestPath)
+	}}
+
+	var err error
+	captureStdout(t, func() {
+		err = runReposUninstall(context.Background(), uninstallOpts(manifestPath, client), []string{"acme/api"})
+	})
+	require.NoError(t, otherErr)
+	require.Equal(t, 1, strings.Count(otherFile, target), "the install recorded the tracker default of acme/web")
+	webInstallation := traceValue(traceInstallationIDRe, otherFile)
+	require.NotEmpty(t, webInstallation, "the install recorded the trace_context of acme/web")
+	require.NoError(t, err)
+
+	_, kept := fc.VariableValues["acme/api/FULLSEND_PER_REPO_INSTALL"]
+	assert.False(t, kept, "acme/api is torn down")
+	final := mustReadFile(t, manifestPath)
+	loaded, err := repos.LoadManifest(context.Background(), manifestPath)
+	require.NoError(t, err)
+	var names []string
+	for _, e := range loaded.AllRepos() {
+		names = append(names, e.Name)
+	}
+	assert.Equal(t, []string{"acme/web"}, names, "acme/api's entry is removed")
+	assert.Equal(t, 1, strings.Count(final, target), "acme/web's tracker default is kept")
+	assert.Contains(t, final, webInstallation, "acme/web's trace_context is kept")
+}
+
+// A repos.yaml that cannot be read or loaded again after the teardown stops
+// the uninstall with that error, not with a write of the stale copy, and the
+// error names the torn-down repos and the --manifest-only retry.
+func TestRunReposUninstall_ManifestUnusableAfterTeardownIsReported(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		change  func(t *testing.T, path string)
+		wantIs  error
+		wantMsg string
+	}{
+		{"deleted", func(t *testing.T, path string) { require.NoError(t, os.Remove(path)) }, fs.ErrNotExist, "reading"},
+		{"unparsable", func(t *testing.T, path string) {
+			require.NoError(t, os.WriteFile(path, []byte("version: [\n"), 0o644))
+		}, nil, "again, which changed after this run loaded it: parsing manifest YAML"},
+		{"invalid", func(t *testing.T, path string) {
+			require.NoError(t, os.WriteFile(path, []byte(strings.Replace(twoRepoManifestYAML, "version: 1", "version: 99", 1)), 0o644))
+		}, nil, "changed after this run loaded it and no longer validates: unsupported manifest version 99"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			manifestPath := writeTestManifest(t, twoRepoManifestYAML)
+			fc := newInstalledFakeClientCLI("acme/api", "acme/web")
+			client := &teardownHookClient{FakeClient: fc, other: func() { tc.change(t, manifestPath) }}
+
+			var err error
+			captureStdout(t, func() {
+				err = runReposUninstall(context.Background(), uninstallOpts(manifestPath, client), []string{"acme/api"})
+			})
+			require.Error(t, err)
+			if tc.wantIs != nil {
+				require.ErrorIs(t, err, tc.wantIs)
+			}
+			assert.Contains(t, err.Error(), tc.wantMsg)
+			assert.Contains(t, err.Error(), "acme/api were torn down and are still in the manifest")
+			assert.Contains(t, err.Error(), "repos uninstall --manifest-only acme/api")
+		})
+	}
+}
+
+// An uninstall whose repos.yaml is unchanged since it loaded it removes the
+// torn-down entry as before.
+func TestRunReposUninstall_ManifestUnchangedRemovesEntry(t *testing.T) {
+	manifestPath := writeTestManifest(t, twoRepoManifestYAML)
+	fc := newInstalledFakeClientCLI("acme/api", "acme/web")
+	var err error
+	captureStdout(t, func() {
+		err = runReposUninstall(context.Background(), uninstallOpts(manifestPath, fc), []string{"acme/api"})
+	})
+	require.NoError(t, err)
+	final := mustReadFile(t, manifestPath)
+	assert.NotContains(t, final, "acme/api")
+	assert.Contains(t, final, "acme/web")
+}
+
+// scopeCheckHookClient runs another command the first time the uninstall
+// checks its token, which a dry run does too: after it loaded repos.yaml and
+// before its manifest removal phase.
+type scopeCheckHookClient struct {
+	*forge.FakeClient
+	other func()
+}
+
+func (c *scopeCheckHookClient) IsInstallationToken(ctx context.Context) (bool, error) {
+	if f := c.other; f != nil {
+		c.other = nil
+		f()
+	}
+	return c.FakeClient.IsInstallationToken(ctx)
+}
+
+// A dry-run uninstall does not read repos.yaml again, so a file that no
+// longer loads after it loaded it fails nothing, and it is not written.
+func TestRunReposUninstall_DryRunDoesNotReadManifestAgain(t *testing.T) {
+	const broken = "version: [\n"
+	manifestPath := writeTestManifest(t, twoRepoManifestYAML)
+	fc := newInstalledFakeClientCLI("acme/api", "acme/web")
+	hooked := false
+	client := &scopeCheckHookClient{FakeClient: fc, other: func() {
+		hooked = true
+		require.NoError(t, os.WriteFile(manifestPath, []byte(broken), 0o644))
+	}}
+	opts := uninstallOpts(manifestPath, client)
+	opts.dryRun = true
+
+	var err error
+	captureStdout(t, func() {
+		err = runReposUninstall(context.Background(), opts, []string{"acme/api"})
+	})
+	require.True(t, hooked, "the file changed during the run")
+	require.NoError(t, err)
+	assert.Equal(t, broken, mustReadFile(t, manifestPath), "the dry run does not write the file")
+}
+
+// With --manifest-only nothing is torn down, so a repos.yaml that no longer
+// validates when the removal reads it again is reported without the advice
+// about torn-down repos.
+func TestUninstallRemovalManifest_ManifestOnlyReportsReloadErrorAsIs(t *testing.T) {
+	manifestPath := writeTestManifest(t, twoRepoManifestYAML)
+	loaded, err := repos.LoadManifest(context.Background(), manifestPath)
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(manifestPath, []byte(strings.Replace(twoRepoManifestYAML, "version: 1", "version: 99", 1)), 0o644))
+
+	opts := uninstallOpts(manifestPath, nil)
+	opts.manifestOnly = true
+	_, err = uninstallRemovalManifest(context.Background(), opts, loaded, []string{"acme/api"})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "no longer validates")
+	assert.NotContains(t, err.Error(), "were torn down")
+	assert.NotContains(t, err.Error(), "--manifest-only")
 }
