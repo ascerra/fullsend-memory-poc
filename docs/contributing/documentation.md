@@ -213,6 +213,11 @@ symptoms as well as the command or flag name. A sentence such as "Critical
 findings block the run" describes a command's behavior without naming the
 command. Read the whole section around each hit, not only the matching line.
 
+Both rules exclude point-in-time records. Do not rewrite the Context, Decision,
+or Consequences of accepted ADRs under `docs/ADRs/`; write a superseding ADR
+instead (see [ADRs](adrs.md)). Leave the archived roadmaps under
+`docs/archived-roadmaps/` as published.
+
 ## Adding new documentation pages
 
 When adding a new doc under `docs/`, check `docs/.vitepress/config.ts` sidebar

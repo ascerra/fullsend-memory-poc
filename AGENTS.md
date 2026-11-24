@@ -77,7 +77,10 @@ full documentation site.
   change alters behavior (exit codes, error and blocking conditions, defaults,
   `fail_mode` effects), search `docs/` for the behavior and its symptoms as well
   as the command or flag name, then read the whole section around each hit,
-  not only the matching line. See
+  not only the matching line. Leave point-in-time records out of both: do not
+  rewrite accepted ADRs under `docs/ADRs/` (see
+  [ADRs](docs/contributing/adrs.md)) or the archived roadmaps under
+  `docs/archived-roadmaps/`. See
   [Documentation](docs/contributing/documentation.md).
 - When extending a Go interface with new methods, see
   [Go Code § Interface documentation](docs/contributing/go-code.md) for sync
