@@ -1958,6 +1958,25 @@ agents:
 		assert.Equal(t, "opus", effectiveLint(t, dir).Model)
 		assert.Contains(t, out.String(), `model="opus" effort="high"`)
 	})
+
+	t.Run("enable-then-disable pair keeps the written entry's local model", func(t *testing.T) {
+		dir := t.TempDir()
+		writeBase(t, dir)
+		writePerRepoConfig(t, dir, `agents:
+  - name: lint
+    model: haiku
+  - name: lint
+    enabled: false
+`)
+		require.NoError(t, runAgentSet(dir, "lint", agentSetFlags{effort: "high", effortSet: true}, ui.New(os.Stdout)))
+		cfg, err := loadAgentConfig(filepath.Join(dir, "config.yaml"))
+		require.NoError(t, err)
+		local := localAgentEntries(cfg)
+		require.Len(t, local, 2)
+		assert.Equal(t, config.AgentEntry{Name: "lint", Model: "haiku", Effort: "high"}, local[0])
+		assert.Equal(t, "lint", local[1].Name)
+		assert.False(t, local[1].IsEnabled())
+	})
 }
 
 // agent add and agent remove write only the overlay's own entries, not the base layer's.
@@ -2611,6 +2630,42 @@ func TestRunAgentSet_OpenAISubagentWarnsWithoutProvider(t *testing.T) {
 			}
 		})
 	}
+}
+
+// The openai-subagent warning checks the effective runtime: a runtime: pi
+// inherited only from config.base.yaml still triggers it when --runtime is
+// not passed.
+func TestRunAgentSet_OpenAISubagentWarnsOnBaseLayerRuntime(t *testing.T) {
+	dir := t.TempDir()
+	for _, d := range []string{"harness", "agents"} {
+		require.NoError(t, os.MkdirAll(filepath.Join(dir, d), 0o755))
+	}
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "agents", "mix.md"), []byte("You probe.\n"), 0o644))
+	require.NoError(t, os.MkdirAll(filepath.Join(dir, "skills", "probe", "sub-agents"), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "skills", "probe", "SKILL.md"),
+		[]byte("---\nname: probe\ndescription: probe\n---\nProbe.\n"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "skills", "probe", "sub-agents", "checker.md"),
+		[]byte("---\nname: checker\nmodel: sonnet\n---\nCheck.\n"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "harness", "mix.yaml"),
+		[]byte("agent: agents/mix.md\nrole: test\nmodel: opus\nskills:\n  - skills/probe\nproviders:\n  - vertex-ai\n"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, config.BaseConfigFile), []byte(`version: "1"
+agents:
+  - name: mix
+    source: harness/mix.yaml
+    runtime: pi
+`), 0o644))
+	writePerRepoConfig(t, dir, "")
+
+	var out bytes.Buffer
+	require.NoError(t, runAgentSet(dir, "mix", agentSetFlags{
+		subagentSet: true, subagentArgs: []string{"checker=openai/gpt-5.6-luna"},
+	}, ui.New(&out)))
+	assert.Contains(t, out.String(), "declares no openai provider")
+
+	// The inherited runtime is not frozen into the overlay.
+	overlay, err := os.ReadFile(filepath.Join(dir, config.OverlayConfigFile))
+	require.NoError(t, err)
+	assert.NotContains(t, string(overlay), "runtime:")
 }
 
 // The agent-editing commands resolve the allowlist the way the commands
