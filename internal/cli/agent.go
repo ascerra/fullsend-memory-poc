@@ -230,9 +230,13 @@ func runAgentSet(fullsendDir, agentName string, f agentSetFlags, printer *ui.Pri
 		return fmt.Errorf("agent set applies to per-repo configs; %s is an org config", configPath)
 	}
 
-	// Start from the current effective values so an unset flag keeps them.
-	current, _ := config.AgentSettingsFor(cfg.AgentEntries(), agentName)
-	runtimeName, model, effort := current.Runtime, current.Model, current.Effort
+	// Seed from the overlay's own entry so an unset flag keeps this
+	// layer's value: writing the merged values back would freeze the
+	// parent layer's settings into this config. Read the entry that
+	// config.UpsertAgentSettings writes (the first one with this name), so
+	// an enable/disable pair in this layer cannot drop a local value.
+	localEntry := firstAgentEntry(localAgentEntries(cfg), agentName)
+	runtimeName, model, effort := localEntry.Runtime, localEntry.Model, localEntry.Effort
 	if f.runtimeSet {
 		runtimeName = f.runtime
 	}
@@ -243,14 +247,10 @@ func runAgentSet(fullsendDir, agentName string, f agentSetFlags, printer *ui.Pri
 		effort = f.effort
 	}
 
-	// Seed from the overlay's own entry: writing the merged map back
-	// would freeze the parent layer's entries into this config.
-	localSubagents, _ := config.AgentSettingsFor(localAgentEntries(cfg), agentName)
-
 	var subagents map[string]*string
-	if localSubagents.Subagents != nil {
-		subagents = make(map[string]*string, len(localSubagents.Subagents))
-		for k, v := range localSubagents.Subagents {
+	if localEntry.Subagents != nil {
+		subagents = make(map[string]*string, len(localEntry.Subagents))
+		for k, v := range localEntry.Subagents {
 			// A nil value is a tombstone; carry it over rather than
 			// dereferencing it.
 			if v == nil {
@@ -309,13 +309,15 @@ func runAgentSet(fullsendDir, agentName string, f agentSetFlags, printer *ui.Pri
 	if err := os.WriteFile(configPath, data, 0o644); err != nil {
 		return fmt.Errorf("writing config: %w", err)
 	}
-	msg := fmt.Sprintf("Set agent %q: runtime=%q model=%q effort=%q (empty = inherit)", agentName, runtimeName, model, effort)
+	// Report the effective values (this layer merged onto its parents).
+	effective, _ := config.AgentSettingsFor(cfg.AgentEntries(), agentName)
+	msg := fmt.Sprintf("Set agent %q: runtime=%q model=%q effort=%q (empty = inherit)", agentName, effective.Runtime, effective.Model, effective.Effort)
 	if s := formatSubagents(subagents); s != "" {
 		msg += " subagents: " + s
 	}
 	printer.StepDone(msg)
 	if f.subagentSet {
-		warnOpenAISubagentWithoutProvider(cfg, absDir, agentName, runtimeName, subagents, printer)
+		warnOpenAISubagentWithoutProvider(cfg, absDir, agentName, effective.Runtime, subagents, printer)
 	}
 	return nil
 }
@@ -341,6 +343,19 @@ func formatSubagents(subagents map[string]*string) string {
 		}
 	}
 	return strings.Join(parts, " ")
+}
+
+// firstAgentEntry returns the first entry named name (case-insensitive),
+// or the zero entry when there is none. config.UpsertAgentSettings updates
+// this same entry; config.AgentSettingsFor returns the last one instead.
+func firstAgentEntry(agents []config.AgentEntry, name string) config.AgentEntry {
+	lower := strings.ToLower(name)
+	for _, a := range agents {
+		if strings.ToLower(a.DerivedName()) == lower {
+			return a
+		}
+	}
+	return config.AgentEntry{}
 }
 
 // localAgentEntries returns the entries the overlay itself declares (the
