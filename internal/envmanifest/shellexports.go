@@ -27,6 +27,16 @@ var envNameRe = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
 // not a shell: it handles single and double quotes, backslash escapes,
 // $(...) nesting, comments, and the ; && || | & ( ) { } newline
 // separators, which is the subset the runner's emitters generate.
+//
+// Commands are applied in order. "export -n NAME" removes the export
+// attribute, so a name un-exported before any child process runs is not
+// reported ("export FOO=bar; export -n FOO"). A name is reported once it
+// reaches a child process (any command that is not a shell builtin, "sh -c"
+// included) or is still exported when the script ends, so un-exporting it
+// after a child already inherited it ("export FOO=1; cmd; export -n FOO")
+// does not take it back. "export -f" names functions, not variables, and
+// is ignored. Each script starts with nothing exported, and the result is
+// the union across scripts.
 func ExportedNames(scripts ...string) []string {
 	seen := map[string]bool{}
 	for _, script := range scripts {
@@ -74,17 +84,39 @@ func (w shellWord) assignmentName() string {
 	return name
 }
 
+// exportState tracks one shell's export attributes while its script is
+// walked in order.
+type exportState struct {
+	// seen collects the reported names, shared with nested shells.
+	seen map[string]bool
+	// exported holds the names that carry the export attribute right now
+	// in this shell.
+	exported map[string]bool
+}
+
+// spawn records that a child process starts here: it inherits every name
+// currently exported.
+func (s *exportState) spawn() {
+	for name := range s.exported {
+		s.seen[name] = true
+	}
+}
+
 func collectExportedNames(script string, seen map[string]bool, depth int) {
 	if depth > maxShellDepth {
 		return
 	}
+	st := &exportState{seen: seen, exported: map[string]bool{}}
 	for _, words := range shellCommands(script) {
-		collectFromCommand(words, seen, depth)
+		collectFromCommand(words, st, depth)
 	}
+	// Names still exported at the end reach whatever the script runs next.
+	st.spawn()
 }
 
-// collectFromCommand records the names one simple command exports.
-func collectFromCommand(words []shellWord, seen map[string]bool, depth int) {
+// collectFromCommand applies one simple command to st.
+func collectFromCommand(words []shellWord, st *exportState, depth int) {
+	seen := st.seen
 	// Leading NAME=value words are prefix assignments when a command
 	// follows them, and shell-local assignments when nothing does.
 	i := 0
@@ -99,19 +131,13 @@ func collectFromCommand(words []shellWord, seen map[string]bool, depth int) {
 		for _, w := range words[:i] {
 			seen[w.assignmentName()] = true
 		}
+		if cmd != "export" && cmd != "readonly" {
+			st.spawn()
+		}
 	}
 	switch cmd {
 	case "export":
-		for _, a := range args {
-			if strings.HasPrefix(a.text, "-") {
-				continue
-			}
-			if name := a.assignmentName(); name != "" {
-				seen[name] = true
-			} else if envNameRe.MatchString(a.text) {
-				seen[a.text] = true
-			}
-		}
+		applyExport(args, st)
 	case "env":
 		for j, a := range args {
 			if strings.HasPrefix(a.text, "-") {
@@ -119,19 +145,55 @@ func collectFromCommand(words []shellWord, seen map[string]bool, depth int) {
 			}
 			name := a.assignmentName()
 			if name == "" {
-				collectFromCommand(args[j:], seen, depth)
+				collectFromCommand(args[j:], st, depth)
 				return
 			}
 			seen[name] = true
 		}
 	case "exec", "command", "nohup":
-		collectFromCommand(args, seen, depth)
+		collectFromCommand(args, st, depth)
 	case "sh", "bash", "/bin/sh", "/bin/bash":
 		for j, a := range args {
 			if strings.HasPrefix(a.text, "-") && strings.Contains(a.text, "c") && j+1 < len(args) {
 				collectExportedNames(args[j+1].text, seen, depth+1)
 				return
 			}
+		}
+	}
+}
+
+// applyExport applies the arguments of one export builtin to st. Options
+// come first and end at "--" or at the first word that does not start with
+// "-", as in bash. -n removes the export attribute instead of setting it
+// ("export -n NAME=value" assigns but does not export), and -f makes the
+// names functions, which never reach the environment as variables. -p
+// only adds a listing, so its names are still exported.
+func applyExport(args []shellWord, st *exportState) {
+	unexport, functions := false, false
+	for len(args) > 0 && strings.HasPrefix(args[0].text, "-") {
+		opt := args[0].text
+		args = args[1:]
+		if opt == "--" {
+			break
+		}
+		unexport = unexport || strings.Contains(opt, "n")
+		functions = functions || strings.Contains(opt, "f")
+	}
+	if functions {
+		return
+	}
+	for _, a := range args {
+		name := a.assignmentName()
+		if name == "" && envNameRe.MatchString(a.text) {
+			name = a.text
+		}
+		if name == "" {
+			continue
+		}
+		if unexport {
+			delete(st.exported, name)
+		} else {
+			st.exported[name] = true
 		}
 	}
 }
