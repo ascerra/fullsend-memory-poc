@@ -69,9 +69,15 @@ full documentation site.
   sidebar config and search scopes if not in an auto-discovered section. See
   [Documentation § Adding new documentation pages](docs/contributing/documentation.md#adding-new-documentation-pages).
 - When modifying CLI commands, flags, public APIs, or configuration/environment
-  variables, update all documentation references across `docs/cli/` and
-  `docs/guides/`. Note that `docs/cli/` reference pages are manually maintained
-  and will not auto-update. See
+  variables, update all documentation references across `docs/`, including
+  `docs/cli/`, `docs/guides/`, `docs/contributing/` (for example
+  `runtime-implementation.md`, `harness-fields.md`, `workflow-contracts.md`,
+  `sandbox-topology.md`), and `docs/architecture.md`. Note that `docs/cli/`
+  reference pages are manually maintained and will not auto-update. When a
+  change alters behavior (exit codes, error and blocking conditions, defaults,
+  `fail_mode` effects), search `docs/` for the behavior and its symptoms as well
+  as the command or flag name, then read the whole section around each hit,
+  not only the matching line. See
   [Documentation](docs/contributing/documentation.md).
 - When extending a Go interface with new methods, see
   [Go Code § Interface documentation](docs/contributing/go-code.md) for sync

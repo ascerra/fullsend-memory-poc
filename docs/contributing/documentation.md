@@ -201,7 +201,17 @@ existing paragraph only when you are already editing it.
 CLI reference pages under `docs/cli/` are manually maintained and will not
 auto-update. When modifying CLI commands, flag help text, defaults, or behavior
 in `internal/cli/`, update the corresponding reference page in `docs/cli/` as
-well as relevant tables and descriptions in `docs/guides/`.
+well as every other reference across `docs/`. That includes relevant tables and
+descriptions in `docs/guides/`, the runtime and CLI semantics documented in
+`docs/contributing/` (for example `runtime-implementation.md`,
+`harness-fields.md`, `workflow-contracts.md`, `sandbox-topology.md`), and
+`docs/architecture.md`.
+
+When a change alters behavior (exit codes, error and blocking conditions,
+defaults, `fail_mode` effects), search `docs/` for the behavior and its
+symptoms as well as the command or flag name. A sentence such as "Critical
+findings block the run" describes a command's behavior without naming the
+command. Read the whole section around each hit, not only the matching line.
 
 ## Adding new documentation pages
 
