@@ -32,11 +32,17 @@ var envNameRe = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
 // attribute, so a name un-exported before any child process runs is not
 // reported ("export FOO=bar; export -n FOO"). A name is reported once it
 // reaches a child process (any command that is not a shell builtin, "sh -c"
-// included) or is still exported when the script ends, so un-exporting it
-// after a child already inherited it ("export FOO=1; cmd; export -n FOO")
-// does not take it back. "export -f" names functions, not variables, and
-// is ignored. Each script starts with nothing exported, and the result is
-// the union across scripts.
+// included, or any command with a $(...) or `...` substitution) or is
+// still exported when the script ends, so un-exporting it after a child
+// already inherited it ("export FOO=1; cmd; export -n FOO") does not take
+// it back. An "export -n" only counts when it is an unconditional
+// top-level command: one inside ( ) or { }, in a pipeline or background
+// job, after && or ||, or inside an if, while, until, for, select or case
+// body is ignored, because it may not run or may not affect this shell.
+// The parser over-reports in those cases rather than under-reports.
+// "export -f" names functions, not variables, and is ignored. Each script
+// starts with nothing exported, and the result is the union across
+// scripts.
 func ExportedNames(scripts ...string) []string {
 	seen := map[string]bool{}
 	for _, script := range scripts {
@@ -107,16 +113,25 @@ func collectExportedNames(script string, seen map[string]bool, depth int) {
 		return
 	}
 	st := &exportState{seen: seen, exported: map[string]bool{}}
-	for _, words := range shellCommands(script) {
-		collectFromCommand(words, st, depth)
+	for _, c := range shellCommands(script) {
+		collectFromCommand(c.words, c.unconditional, st, depth)
 	}
 	// Names still exported at the end reach whatever the script runs next.
 	st.spawn()
 }
 
-// collectFromCommand applies one simple command to st.
-func collectFromCommand(words []shellWord, st *exportState, depth int) {
+// collectFromCommand applies one simple command to st. unconditional
+// reports that the command always runs in this shell (see shellCommand).
+func collectFromCommand(words []shellWord, unconditional bool, st *exportState, depth int) {
 	seen := st.seen
+	// A command substitution runs a child process before the command
+	// itself, even on an assignment or a builtin.
+	for _, w := range words {
+		if strings.Contains(w.text, "$(") || strings.Contains(w.text, "`") {
+			st.spawn()
+			break
+		}
+	}
 	// Leading NAME=value words are prefix assignments when a command
 	// follows them, and shell-local assignments when nothing does.
 	i := 0
@@ -137,7 +152,7 @@ func collectFromCommand(words []shellWord, st *exportState, depth int) {
 	}
 	switch cmd {
 	case "export":
-		applyExport(args, st)
+		applyExport(args, unconditional, st)
 	case "env":
 		for j, a := range args {
 			if strings.HasPrefix(a.text, "-") {
@@ -145,13 +160,13 @@ func collectFromCommand(words []shellWord, st *exportState, depth int) {
 			}
 			name := a.assignmentName()
 			if name == "" {
-				collectFromCommand(args[j:], st, depth)
+				collectFromCommand(args[j:], unconditional, st, depth)
 				return
 			}
 			seen[name] = true
 		}
 	case "exec", "command", "nohup":
-		collectFromCommand(args, st, depth)
+		collectFromCommand(args, unconditional, st, depth)
 	case "sh", "bash", "/bin/sh", "/bin/bash":
 		for j, a := range args {
 			if strings.HasPrefix(a.text, "-") && strings.Contains(a.text, "c") && j+1 < len(args) {
@@ -167,8 +182,10 @@ func collectFromCommand(words []shellWord, st *exportState, depth int) {
 // "-", as in bash. -n removes the export attribute instead of setting it
 // ("export -n NAME=value" assigns but does not export), and -f makes the
 // names functions, which never reach the environment as variables. -p
-// only adds a listing, so its names are still exported.
-func applyExport(args []shellWord, st *exportState) {
+// only adds a listing, so its names are still exported. An un-export is
+// applied only when unconditional is true; otherwise it may not run, or
+// may run in a subshell, so the names stay exported.
+func applyExport(args []shellWord, unconditional bool, st *exportState) {
 	unexport, functions := false, false
 	for len(args) > 0 && strings.HasPrefix(args[0].text, "-") {
 		opt := args[0].text
@@ -191,23 +208,60 @@ func applyExport(args []shellWord, st *exportState) {
 			continue
 		}
 		if unexport {
-			delete(st.exported, name)
+			if unconditional {
+				delete(st.exported, name)
+			}
 		} else {
 			st.exported[name] = true
 		}
 	}
 }
 
+// shellCommand is one simple command. unconditional is true when the
+// command always runs in the script's own shell: it is not inside ( ) or
+// { }, not in a pipeline or background job, not after && or ||, and not in
+// an if, while, until, for, select or case.
+type shellCommand struct {
+	words         []shellWord
+	unconditional bool
+}
+
+// compoundOpen and compoundClose are the reserved words that start and end
+// a compound command whose body may not run. compoundBody words lead a
+// body command inside one.
+var (
+	compoundOpen  = map[string]bool{"if": true, "while": true, "until": true, "for": true, "select": true, "case": true}
+	compoundClose = map[string]bool{"fi": true, "done": true, "esac": true}
+	compoundBody  = map[string]bool{"then": true, "else": true, "elif": true, "do": true}
+)
+
+// condBefore reports that the command following sep may not run, or runs
+// in a subshell. condAfter reports that the command ending at sep runs in
+// a subshell (a pipeline member or background job).
+func condBefore(sep string) bool {
+	return sep == "&&" || sep == "||" || sep == "|" || sep == "|&" || sep == "&"
+}
+
+func condAfter(sep string) bool {
+	return sep == "|" || sep == "|&" || sep == "&"
+}
+
 // shellCommands splits script into simple commands, each a list of words
 // with quotes removed. Command substitutions are kept as opaque word text.
-func shellCommands(script string) [][]shellWord {
+func shellCommands(script string) []shellCommand {
 	var (
-		cmds       [][]shellWord
+		cmds       []shellCommand
 		words      []shellWord
 		cur        strings.Builder
 		inWord     bool
 		nameQuoted bool
 		sawEq      bool
+		// prevSep is the separator before the current command; "" at the
+		// start of the script.
+		prevSep string
+		// groupDepth counts open ( ) and { } groups; compoundDepth counts
+		// open if/while/until/for/select/case commands.
+		groupDepth, compoundDepth int
 	)
 	endWord := func() {
 		if inWord {
@@ -216,12 +270,32 @@ func shellCommands(script string) [][]shellWord {
 		cur.Reset()
 		inWord, nameQuoted, sawEq = false, false, false
 	}
-	endCmd := func() {
+	endCmd := func(sep string) {
 		endWord()
-		if len(words) > 0 {
-			cmds = append(cmds, words)
+		if len(words) == 0 {
+			// A newline after && || | & continues the same list.
+			if sep != ";" || !condBefore(prevSep) {
+				prevSep = sep
+			}
+			return
 		}
-		words = nil
+		unconditional := groupDepth == 0 && compoundDepth == 0 &&
+			!condBefore(prevSep) && !condAfter(sep)
+		// Leading reserved words open or close compound commands, and a
+		// command led by one is part of a compound command, so it is
+		// conditional.
+		for _, w := range words {
+			if compoundOpen[w.text] {
+				compoundDepth++
+			} else if compoundClose[w.text] {
+				compoundDepth = max(compoundDepth-1, 0)
+			} else if !compoundBody[w.text] {
+				break
+			}
+			unconditional = false
+		}
+		cmds = append(cmds, shellCommand{words: words, unconditional: unconditional})
+		words, prevSep = nil, sep
 	}
 	quote := func() {
 		inWord = true
@@ -271,15 +345,26 @@ func shellCommands(script string) [][]shellWord {
 			}
 		case c == ' ' || c == '\t':
 			endWord()
-		case c == '\n' || c == ';' || c == '&' || c == '|' || c == '(' || c == ')':
-			endCmd()
-		case (c == '{' || c == '}') && !inWord:
-			endCmd()
+		case c == '\n' || c == ';':
+			endCmd(";")
+		case c == '&' || c == '|':
+			sep := string(c)
+			if i+1 < len(script) && (script[i+1] == c || (c == '|' && script[i+1] == '&')) {
+				i++
+				sep += string(script[i])
+			}
+			endCmd(sep)
+		case c == '(' || (c == '{' && !inWord):
+			endCmd(string(c))
+			groupDepth++
+		case c == ')' || (c == '}' && !inWord):
+			endCmd(string(c))
+			groupDepth = max(groupDepth-1, 0)
 		case c == '#' && !inWord:
 			for i < len(script) && script[i] != '\n' {
 				i++
 			}
-			endCmd()
+			endCmd(";")
 		default:
 			inWord = true
 			if c == '=' {
@@ -288,7 +373,7 @@ func shellCommands(script string) [][]shellWord {
 			cur.WriteByte(c)
 		}
 	}
-	endCmd()
+	endCmd("")
 	return cmds
 }
 
