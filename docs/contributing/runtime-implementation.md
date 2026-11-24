@@ -670,7 +670,9 @@ defense-in-depth passes before the agent starts:
 2. **Sandbox-side (Path B, step 9b):** `buildScanContextCommand()` runs
    `fullsend scan context` inside the sandbox after all files are assembled.
 
-Critical findings block the run in `fail_mode: closed`.
+In `fail_mode: closed`, the run is blocked by critical findings, or by the
+sandbox-side `scan context` failing to read a requested known context file.
+`scan context` exits 1 in both cases, and it still scans the remaining files.
 
 ## Dummy runtime operations
 
